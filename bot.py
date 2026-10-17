@@ -1,10 +1,15 @@
 import asyncio
+import os
+import sys
 from playwright.async_api import async_playwright
 
 MSG = "Automa test message"
 TICK = 0.02
+SESSION_DIR = "./snap_session"
 
-# The exact JS logic to find the b7 button and invoke React's onClick
+def log(msg):
+    print(msg, flush=True)
+
 JS_CYCLE = r"""
 (args) => {
   const MSG = args.MSG;
@@ -15,24 +20,17 @@ JS_CYCLE = r"""
   };
   const PKEY = getPKEY();
   if (!PKEY) return { status: 'no_pkey' };
-
   const cs = [...document.querySelectorAll('[contenteditable="true"]')].filter(e => e.isConnected);
   if (!cs.length) return { status: 'no_composer' };
   cs.sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top);
   const c = cs[0];
-
-  if (document.activeElement !== c) {
-    try { c.click(); } catch (_) {}
-    try { c.focus(); } catch (_) {}
-  }
-
+  if (document.activeElement !== c) { try { c.click(); } catch(_){} try { c.focus(); } catch(_){} }
   if ((c.textContent || '').trim()) {
     document.execCommand('selectAll', false, null);
     document.execCommand('delete', false, null);
   }
   document.execCommand('insertText', false, MSG);
   if (!(c.textContent || '').includes(MSG)) return { status: 'type_failed' };
-
   let sendBtn = null, sendFn = null;
   for (const b of document.querySelectorAll('button')) {
     if (b.disabled) continue;
@@ -46,7 +44,6 @@ JS_CYCLE = r"""
     sendBtn = b; sendFn = fn; break;
   }
   if (!sendBtn) return { status: 'no_send_btn' };
-
   const evt = {
     type: 'click', target: sendBtn, currentTarget: sendBtn,
     nativeEvent: { type: 'click', target: sendBtn, isTrusted: true },
@@ -69,53 +66,67 @@ JS_CLEARED = r"""
 """
 
 async def main():
-    async with async_playwright() as p:
-        # headless=False with xvfb-run is required for Snapchat login
-        ctx = await p.chromium.launch_persistent_context(
-            "./snap_session",
-            headless=False,
-            args=["--no-sandbox", "--disable-blink-features=AutomationControlled", "--disable-dev-shm-usage"],
-            viewport={"width": 1280, "height": 900},
-        )
-        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
-        await page.goto("https://web.snapchat.com/web")
+    log("[startup] bot.py started")
+    log(f"[startup] cwd={os.getcwd()}")
+    log(f"[startup] session dir exists: {os.path.exists(SESSION_DIR)}")
+    if os.path.exists(SESSION_DIR):
+        log(f"[startup] session contents: {os.listdir(SESSION_DIR)}")
 
-        print(">>> Log in, open the chat you want to spam.")
-        print(">>> Press Enter here when ready.")
-        input()  # Wait for manual login on first run
+    log("[startup] launching playwright...")
+    try:
+        async with async_playwright() as p:
+            log("[startup] playwright context created")
+            ctx = await p.chromium.launch_persistent_context(
+                SESSION_DIR,
+                headless=False,
+                args=["--no-sandbox", "--disable-blink-features=AutomationControlled", "--disable-dev-shm-usage"],
+                viewport={"width": 1280, "height": 900},
+            )
+            log("[startup] browser launched")
+            page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+            log("[startup] navigating to snapchat...")
+            await page.goto("https://web.snapchat.com/web", timeout=60000)
+            log("[startup] page loaded")
 
-        sent, fails = 0, 0
-        while True:
-            try:
-                r = await page.evaluate(JS_CYCLE, {"MSG": MSG})
-                status = r.get("status", "?")
+            # Only wait for input if no session cookies present
+            if not os.path.exists(os.path.join(SESSION_DIR, "Default")) and not os.listdir(SESSION_DIR):
+                log(">>> NO SESSION: log in manually, then press Enter. (Will hang on Railway)")
+                input()
 
-                if status in ("no_pkey", "no_composer", "no_send_btn", "type_failed"):
-                    fails += 1
-                    await asyncio.sleep(0.2 if fails < 3 else 1.0)
-                    continue
-
-                if status == "clicked":
-                    await asyncio.sleep(TICK)
-                    if await page.evaluate(JS_CLEARED, [MSG]):
-                        sent += 1; fails = 0
-                    else:
-                        # Fallback: CDP-trusted Enter (the thing Automa can't do)
-                        try: await page.keyboard.press("Enter")
-                        except Exception: pass
+            log("[run] entering send loop")
+            sent, fails = 0, 0
+            while True:
+                try:
+                    r = await page.evaluate(JS_CYCLE, {"MSG": MSG})
+                    status = r.get("status", "?")
+                    if status in ("no_pkey", "no_composer", "no_send_btn", "type_failed"):
+                        fails += 1
+                        log(f"[cycle] {status} (fails={fails})")
+                        await asyncio.sleep(0.2 if fails < 3 else 1.0)
+                        continue
+                    if status == "clicked":
                         await asyncio.sleep(TICK)
                         if await page.evaluate(JS_CLEARED, [MSG]):
                             sent += 1; fails = 0
+                            log(f"[send] sent={sent}")
                         else:
-                            fails += 1
-                            await asyncio.sleep(0.1 if fails < 3 else 1.0)
-
-                if (sent + fails) % 100 == 0:
-                    print(f"[py] sent={sent} fails={fails} last_status={status}")
-
-            except Exception as e:
-                print(f"[py] cycle error: {type(e).__name__}: {e}")
-                await asyncio.sleep(0.5)
+                            try: await page.keyboard.press("Enter")
+                            except Exception: pass
+                            await asyncio.sleep(TICK)
+                            if await page.evaluate(JS_CLEARED, [MSG]):
+                                sent += 1; fails = 0
+                                log(f"[send] sent={sent} (via Enter)")
+                            else:
+                                fails += 1
+                                log(f"[cycle] not cleared (fails={fails})")
+                                await asyncio.sleep(0.1 if fails < 3 else 1.0)
+                except Exception as e:
+                    log(f"[cycle] error: {type(e).__name__}: {e}")
+                    await asyncio.sleep(0.5)
+    except Exception as e:
+        log(f"[fatal] {type(e).__name__}: {e}")
+        import traceback; traceback.print_exc()
+        sys.exit(1)
 
 if __name__ == "__main__":
     asyncio.run(main())
